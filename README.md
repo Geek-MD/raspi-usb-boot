@@ -1,7 +1,7 @@
 # usb-boot
 Running Raspbian from USB Devices : Made Easy
 
-Created by RonR, extraxted from https://www.raspberrypi.org/forums/viewtopic.php?f=29&t=196778
+Created by RonR, extracted from https://www.raspberrypi.org/forums/viewtopic.php?f=29&t=196778
 
 
 NOTE: usb-boot as been updated to allow the use of direct USB booting on the Raspberry Pi 4 (in addition to hybrid SD/USB booting on all Raspberry Pi models). usb-boot also allows Raspberry Pi 4 users to migrate their SD card based systems to a USB device.
@@ -10,7 +10,7 @@ A recurring topic of discussion is how to configure and reliably run Raspbian on
 
 A Raspberry Pi 3B+ has a native USB boot mode (this mode has to be manually enabled by setting an OTP bit on a Raspberry Pi 3B). This native USB boot mode has serious compatibility issues. A bootcode.bin file is available for older Raspberry Pi models. Unfortunately, both of these approaches have serious limitations and once working, can easily be broken by simply plugging in an additional USB storage device.
 
-The easiest and most reliable way to run Raspbian on a USB device with any Raspberry Pi is to leave an SD card containing Raspbian in place, but use it only for starting Raspbian that is residing on a USB device. While setting up such a configuration is not rocket science, it can be confusing to a newcomer or someone unfamiliar with Linux internals. In an effort to simplify the task, I've created the attached script named 'usb-boot' to automate the process.
+The easiest and most reliable way to run Raspbian on a USB device with any Raspberry Pi is to leave an SD card containing Raspbian in place, but use it only for starting Raspbian that is residing on a USB device. While setting up such a configuration is not rocket science, it can be confusing to a newcomer or someone unfamiliar with Linux internals. In an effort to simplify the task, I've created a script named 'usb-boot' to automate the process.
 
 If usb-boot is running on a Raspberry Pi 4, usb-boot first prompts: 'Use SD card to boot the USB device?'
 
