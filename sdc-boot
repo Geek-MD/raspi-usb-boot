@@ -1,0 +1,145 @@
+#!/bin/bash
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/sdc-boot-mnt"
+
+mntpart()
+{
+  MNTED=TRUE
+  if [ ! -d "${MNTPATH}/" ]; then
+    mkdir "${MNTPATH}/"
+    if [ $? -ne 0 ]; then
+      errexit "Unable to make partition mount point"
+    fi
+  fi
+  mount "$1" "${MNTPATH}/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to mount $2 partition"
+  fi
+}
+
+umntpart()
+{
+  umount "${MNTPATH}/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to unmount partition"
+  fi
+  rm -r "${MNTPATH}/"
+  MNTED=FALSE
+}
+
+errexit()
+{
+  echo ""
+  echo "$1"
+  echo ""
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/" &> /dev/null
+    rm -rf "${MNTPATH}/" &> /dev/null
+  fi
+  echo "Usage: $0 [ /dev/sdX2 | /dev/mmcblk0p2 | hhhhhhhh-02 | hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh ]"
+  echo ""
+  exit 1
+}
+
+MNTED=FALSE
+if [ $(id -u) -ne 0 ]; then
+  errexit "$0 must be run as root user"
+fi
+PGMNAME="$(basename $0)"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  if [ ${PID} -ne $$ ]; then
+    errexit "${PGMNAME} is already running"
+  fi
+done
+if [ ! -b /dev/mmcblk0 ]; then
+  errexit "No SD card present"
+fi
+DEVICE="$1"
+if [ "${DEVICE}" = "" ]; then
+  mntpart "/dev/mmcblk0p1" "SD card BOOT"
+  DEVICE="$(sed -n '/^[[:space:]]*#/!s|^.*root=\(\S\+\)\s\+.*$|\1|p' "${MNTPATH}/cmdline.txt")"
+  umntpart
+  if [[ "${DEVICE}" =~ ^PARTUUID=.*$ ]]; then
+    DEVICE="$(blkid -l -t "${DEVICE}" | sed -n 's|^\(/dev/.*\):.*|\1|p')"
+  fi
+  PARTUUID="$(blkid "${DEVICE}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+else
+  DEVICE="$(tr [A-Z] [a-z] <<< "${DEVICE}")"
+  if [[ "${DEVICE}" =~ ^[[:xdigit:]]{8}-02$ || "${DEVICE}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+    PARTUUID="${DEVICE}"
+    BLKID="$(blkid -l -t PARTUUID="${PARTUUID}")"
+    if [ $? -ne 0 ]; then
+      errexit "Invalid DEVICE: ${DEVICE}"
+    fi
+    DEVICE="$(sed -n 's|^\(/dev/.*\):.*$|\1|p' <<< "${BLKID}")"
+  fi
+  if [[ ("${DEVICE}" != "/dev/mmcblk0p2" && ! "${DEVICE}" =~ ^/dev/sd[a-z]2$) || ! -b "${DEVICE}" ]]; then
+    errexit "Invalid DEVICE: ${DEVICE}"
+  fi
+  PARTUUID="$(blkid "${DEVICE}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+  echo ""
+  echo -n "Set SD card to boot to ${DEVICE} [PARTUUID=${PARTUUID}] (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        break
+      else
+        errexit "Aborted"
+      fi
+    fi
+  done
+  mntpart "/dev/mmcblk0p1" "SD card BOOT"
+  if [ "${DEVICE}" = "/dev/mmcblk0p2" ]; then
+    sed -i "/^[[:space:]]*#/!s|^\(.*root=\)\S\+\(\s\+.*\)$|\1/dev/mmcblk0p2\2|" "${MNTPATH}/cmdline.txt"
+  else
+    sed -i "/^[[:space:]]*#/!s|^\(.*root=\)\S\+\(\s\+.*\)$|\1PARTUUID=${PARTUUID}\2|" "${MNTPATH}/cmdline.txt"
+  fi
+  umntpart
+  if [ "${DEVICE}" != "/dev/mmcblk0p2" ]; then
+    mntpart "${DEVICE}" "device ROOT"
+    sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/boot\s\+.*\)$|/dev/mmcblk0p1\1|" "${MNTPATH}/etc/fstab"
+    umntpart
+  fi
+fi
+echo ""
+echo "SD card is set to boot to ${DEVICE} [PARTUUID=${PARTUUID}]"
+if [[ "${DEVICE}" != "/dev/mmcblk0p2" && "$(blkid /dev/mmcblk0p2 | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" = "${PARTUUID}" ]]; then
+  echo ""
+  echo "WARNING : SD card (/dev/mmcblk0p2) and USB device (${DEVICE}) have the same PARTUUID (${PARTUUID}) : SD card will boot instead of USB device"
+fi
+DEV_LIST=()
+DEV_LIST+=/dev/mmcblk0p2
+DEV_LIST+=($(ls -l /dev/sd?2 2> /dev/null | sed -n 's|^.*\(/dev/.*\)|\1|p'))
+if [ ${#DEV_LIST[@]} -gt 1 ]; then
+  for i in ${!DEV_LIST[@]}; do
+    if [ ${i} -lt $((${#DEV_LIST[@]} - 1)) ]; then
+      j=$((i + 1))
+      while [ ${j} -lt ${#DEV_LIST[@]} ]; do
+        if [ "$(blkid "${DEV_LIST[i]}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" = "$(blkid "${DEV_LIST[j]}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" ];then
+          if [[ "${DEV_LIST[i]}" != "/dev/mmcblk0p2" && ("${DEV_LIST[i]}" = "${DEVICE}" || "${DEV_LIST[j]}" = "${DEVICE}") ]]; then
+            echo ""
+            echo "WARNING : ${DEV_LIST[i]} and ${DEV_LIST[j]} have the same PARTUUID : $(blkid "${DEV_LIST[i]}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+          fi
+        fi
+      ((j += 1))
+      done
+    fi
+  done
+fi
+echo ""
+if [ "$1" != "" ]; then
+  echo -n "Reboot now (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ ${answer} = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ ${answer} = [yY] ]]; then
+        shutdown -r now
+      fi
+      break
+    fi
+  done
+  echo ""
+fi

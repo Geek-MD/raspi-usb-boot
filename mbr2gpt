@@ -1,0 +1,230 @@
+#!/bin/bash
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/boot-gpt-mnt"
+
+mntpart()
+{
+  MNTED=TRUE
+  if [ ! -d "${MNTPATH}/" ]; then
+    mkdir "${MNTPATH}/"
+    if [ $? -ne 0 ]; then
+      errexit "Unable to make partition mount point"
+    fi
+  fi
+  mount "$1" "${MNTPATH}/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to mount $2 partition"
+  fi
+}
+
+umntpart()
+{
+  umount "${MNTPATH}/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to unmount partition"
+  fi
+  rm -r "${MNTPATH}/"
+  MNTED=FALSE
+}
+
+errexit()
+{
+  echo ""
+  echo "$1"
+  echo ""
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/" &> /dev/null
+    rm -rf "${MNTPATH}/" &> /dev/null
+  fi
+  echo "Usage: $0 /dev/sdX"
+  echo ""
+  exit 1
+}
+
+MNTED=FALSE
+if [ $(id -u) -ne 0 ]; then
+  errexit "$0 must be run as root user"
+fi
+PGMNAME="$(basename $0)"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  if [ ${PID} -ne $$ ]; then
+    errexit "${PGMNAME} is already running"
+  fi
+done
+gdisk -l /dev/null &> /dev/null
+if [ $? -eq 127 ]; then
+  echo ""
+  echo "gdisk not installed"
+  echo ""
+  echo -n "Ok to install gdisk (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        break
+      else
+        errexit "Aborted"
+      fi
+    fi
+  done
+  echo ""
+  echo "Installing gdisk"
+  echo ""
+  apt-get update
+  apt-get install gdisk
+fi
+DEVICE="$1"
+if [ "${DEVICE}" = "" ]; then
+  errexit "No device specified"
+fi
+if [[ ! "${DEVICE}" =~ ^/dev/sd[a-z]$ || ! -b "${DEVICE}" ]]; then
+  errexit "Invalid DEVICE: ${DEVICE}"
+fi
+if [ $(mount | grep -c "^${DEVICE}") -ne 0 ]; then
+  errexit "${DEVICE} is in use (mounted)"
+fi
+PTTYPE="$(blkid ${DEVICE} | sed -n 's|^.*PTTYPE="\(\S\+\)".*|\1|p')"
+PTTYPE="$(tr [a-z] [A-Z] <<< "${PTTYPE}")"
+if [ "${PTTYPE}" = "DOS" ]; then
+  PTTYPE="MBR"
+fi
+if [[ "${PTTYPE}" != "MBR" && "${PTTYPE}" != "GPT" ]]; then
+  errexit "Unsupported partition table type"
+fi
+echo ""
+echo "Partition table type is ${PTTYPE}"
+if [ "${PTTYPE}" = "MBR" ]; then
+  echo ""
+  echo -n "Ok to convert ${DEVICE} to GPT (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        break
+      else
+        errexit "Aborted"
+      fi
+    fi
+  done
+  sgdisk -z "${DEVICE}" &> /dev/null
+fi
+INFO="$(gdisk -l ${DEVICE})"
+LAST=$(sed -n 's|^.*last usable sector is \(\S\+\).*|\1|p' <<< "${INFO}")
+START=$(sed -n 's|^\s\+2\s\+\(\S\+\).*|\1|p' <<< "${INFO}")
+END=$(sed -n 's|^\s\+2\s\+\S\+\s\+\(\S\+\).*|\1|p' <<< "${INFO}")
+SHRINK=FALSE
+EXPAND=FALSE
+SDBOOT=FALSE
+if [ $(grep -c "Warning! Secondary partition table overlaps the last partition" <<< "${INFO}") -ne 0 ]; then
+  echo ""
+  echo "ROOT partition overlaps the Secondary partition table area"
+  echo ""
+  echo -n "Ok to resize ROOT partition (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        break
+      else
+        errexit "Aborted"
+      fi
+    fi
+  done
+  SHRINK=TRUE
+elif [ ${END} -lt ${LAST} ]; then
+  echo ""
+  echo -n "Expand ROOT partition to use all available space (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        EXPAND=TRUE
+      fi
+      break
+    fi
+  done
+fi
+if [ -b /dev/mmcblk0 ]; then
+  echo ""
+  echo -n "Set SD card to boot ${DEVICE} (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        SDBOOT=TRUE
+      fi
+      break
+    fi
+  done
+fi
+if [[ "${PTTYPE}" = "MBR" || "${SHRINK}" = "TRUE" || "${EXPAND}" = "TRUE" || "${SDBOOT}" = "TRUE" ]]; then
+  echo ""
+  echo -n "Ok to process ${DEVICE} (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        break
+      else
+        errexit "Aborted"
+      fi
+    fi
+  done
+  if [ "${SHRINK}" = "TRUE" ]; then
+    echo ""
+    resize2fs -f -M "${DEVICE}2"
+  fi
+  if [[ "${SHRINK}" = "TRUE" || "${EXPAND}" = "TRUE" ]]; then
+    gdisk "${DEVICE}" <<EOF > /dev/null
+d
+2
+n
+2
+${START}
+
+
+w
+y
+EOF
+    echo ""
+    resize2fs -f "${DEVICE}2"
+  fi
+  gdisk "${DEVICE}" <<EOF > /dev/null
+r
+h
+1
+n
+0c
+n
+n
+w
+y
+EOF
+  PARTUUID_1="$(blkid ${DEVICE}1 | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+  PARTUUID_2="$(blkid ${DEVICE}2 | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+  mntpart "${DEVICE}1" "BOOT"
+  sed -i '/^[[:space:]]*#/!s|\(^.*rootwait\).*$|\1|' "${MNTPATH}/cmdline.txt"
+  sed -i "/^[[:space:]]*#/!s|^\(.*root=\)\S\+\(\s\+.*\)$|\1PARTUUID=${PARTUUID_2}\2|" "${MNTPATH}/cmdline.txt"
+  umntpart
+  mntpart "${DEVICE}2" "ROOT"
+  sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/boot\s\+.*\)$|PARTUUID=${PARTUUID_1}\1|" "${MNTPATH}/etc/fstab"
+  sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/\s\+.*\)$|PARTUUID=${PARTUUID_2}\1|" "${MNTPATH}/etc/fstab"
+  umntpart
+  if [ "${SDBOOT}" = "TRUE" ]; then
+    mntpart "/dev/mmcblk0p1" "BOOT"
+    sed -i "/^[[:space:]]*#/!s|^\(.*root=\)\S\+\(\s\+.*\)$|\1PARTUUID=${PARTUUID_2}\2|" "${MNTPATH}/cmdline.txt"
+    umntpart
+    mntpart "${DEVICE}2" "ROOT"
+    sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/boot\s\+.*\)$|/dev/mmcblk0p1\1|" "${MNTPATH}/etc/fstab"
+    umntpart
+  fi
+  if [[ "${SHRINK}" = "FALSE" && "${EXPAND}" = "FALSE" ]]; then
+    echo ""
+  fi
+else
+  echo ""
+  echo "Nothing to do!"
+  echo ""
+fi

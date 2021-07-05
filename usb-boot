@@ -1,0 +1,403 @@
+#!/bin/bash
+
+trap '{ stty sane; echo ""; errexit "Aborted"; }' SIGINT SIGTERM
+
+MNTPATH="/tmp/usb-boot-mnt"
+
+mntdev()
+{
+  MNTED=TRUE
+  if [ ! -d "${MNTPATH}/" ]; then
+    mkdir "${MNTPATH}/"
+    if [ $? -ne 0 ]; then
+      errexit "Unable to make ROOT partition mount point"
+    fi
+  fi
+  mount "${1}2" "${MNTPATH}/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to mount ROOT partition"
+  fi
+  if [ ! -d "${MNTPATH}/boot/" ]; then
+    mkdir -p "${MNTPATH}/boot/"
+    if [ $? -ne 0 ]; then
+      errexit "Unable to make BOOT partition mount point"
+    fi
+  fi
+  mount "${1}1" "${MNTPATH}/boot/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to mount BOOT partition"
+  fi
+}
+
+umntdev()
+{
+  umount "${MNTPATH}/boot/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to unmount BOOT partition"
+  fi
+  umount "${MNTPATH}/"
+  if [ $? -ne 0 ]; then
+    errexit "Unable to unmount ROOT partition"
+  fi
+  rm -r "${MNTPATH}/"
+  MNTED=FALSE
+}
+
+errexit()
+{
+  echo ""
+  echo "$1"
+  echo ""
+  if [ "${MNTED}" = "TRUE" ]; then
+    umount "${MNTPATH}/boot/" &> /dev/null
+    umount "${MNTPATH}/" &> /dev/null
+    rm -rf "${MNTPATH}/" &> /dev/null
+  fi
+  exit 1
+}
+
+MNTED=FALSE
+if [ $(id -u) -ne 0 ]; then
+  errexit "Must be run as root user: sudo $0"
+fi
+PGMNAME="$(basename $0)"
+for PID in $(pidof -x -o %PPID "${PGMNAME}"); do
+  if [ ${PID} -ne $$ ]; then
+    errexit "${PGMNAME} is already running"
+  fi
+done
+gdisk -l "${DEVICE}" &> /dev/null
+if [ $? -eq 127 ]; then
+  echo ""
+  echo "gdisk not installed"
+  echo ""
+  echo -n "Ok to install gdisk (y/n)? "
+  while read -r -n 1 -s answer; do
+    if [[ "${answer}" = [yYnN] ]]; then
+      echo "${answer}"
+      if [[ "${answer}" = [yY] ]]; then
+        break
+      else
+        errexit "Aborted"
+      fi
+    fi
+  done
+  echo ""
+  echo "Installing gdisk"
+  echo ""
+  apt-get update
+  apt-get install gdisk
+fi
+rsync --version &> /dev/null
+if [ $? -ne 0 ]; then
+  errexit "rsync not installed (run: apt-get install rsync)"
+fi
+ROOT_PART="$(mount | sed -n 's|^\(/dev/.*\) on / .*|\1|p')"
+ROOT_DEV="$(sed 's/[0-9]\+$//' <<< "${ROOT_PART}")"
+if [ "${ROOT_DEV}" = "/dev/mmcblk0p" ]; then
+  ROOT_DEV="${ROOT_DEV:0:(${#ROOT_DEV} - 1)}"
+fi
+ROOT_TYPE="$(blkid "${ROOT_PART}" | sed -n 's|^.*TYPE="\(\S\+\)".*|\1|p')"
+if [ -b /dev/mmcblk0 ]; then
+  USESDC=TRUE
+else
+  USESDC=FALSE
+fi
+if [ $(cat /proc/cpuinfo | grep -c "^Revision\s\+:\s\+[abcd]0311[124]$") -ne 0 ]; then
+  RPI_4=TRUE
+else
+  RPI_4=FALSE
+fi
+if [ "$(vcgencmd otp_dump | grep 17:)" = "17:3020000a" ]; then
+  RPI_3=TRUE
+else
+  RPI_3=FALSE
+fi
+if [[ "${USESDC}" = "TRUE" && "${RPI_4}" = "TRUE" ]]; then
+  whiptail --backtitle "USB Boot" --title "USB Boot Method"  --yesno "\nUse SD card to boot the USB device?" 12 40
+  YESNO=$?
+  if [ ${YESNO} -eq 255 ]; then
+    errexit "Aborted"
+  elif [ ${YESNO} -ne 0 ]; then
+    USESDC=FALSE
+  fi
+elif [[ "${USESDC}" = "TRUE" && "${RPI_3}" = "TRUE" ]]; then
+  whiptail --backtitle "USB Boot" --title "USB Boot Method"  --yesno "\nUse SD card to boot the USB device (recommended)?" 12 54
+  YESNO=$?
+  if [ ${YESNO} -eq 255 ]; then
+    errexit "Aborted"
+  elif [ ${YESNO} -ne 0 ]; then
+    USESDC=FALSE
+  fi
+elif [[ "${USESDC}" = "FALSE" && "${RPI_4}" = "FALSE" && "${RPI_3}" = "FALSE" ]]; then
+  errexit "Not a Raspberry Pi 4, Raspberry Pi 3B+, or Raspberry Pi 3B with OTP set, and no SD card present or used"
+fi
+USBDEVS=($(ls -l /dev/sd? 2> /dev/null | sed -n 's|^.*\(/dev/.*\)|\1|p'))
+if [ ${#USBDEVS[@]} -eq 0 ]; then
+  errexit "No available USB mass storage devices found"
+fi
+for i in ${!USBDEVS[@]}; do
+  USBDEVS[i]="${USBDEVS[i]} ${USBDEVS[i]} OFF"
+done
+USB_DEST="$(whiptail --backtitle "USB Boot" --title "USB Mass Storage Devices" --notags --radiolist \
+"\nSelect the USB mass storage device to boot" 13 47 ${#USBDEVS[@]} ${USBDEVS[@]} 3>&1 1>&2 2>&3)"
+if [[ $? -ne 0 || "${USB_DEST}" = "" ]]; then
+  errexit "Aborted"
+fi
+USB_BOOT="${USB_DEST}1"
+USB_ROOT="${USB_DEST}2"
+if [ "${ROOT_DEV}" != "${USB_DEST}" ]; then
+  whiptail --backtitle "USB Boot" --title "Replicate BOOT/ROOT Contents"  --yesno "\nReplicate BOOT/ROOT contents from ${ROOT_DEV} to ${USB_DEST}?" 12 64
+  YESNO=$?
+  if [ ${YESNO} -eq 255 ]; then
+    errexit "Aborted"
+  elif [ ${YESNO} -eq 0 ]; then
+    if [ $(mount | grep -c "^${USB_DEST}") -ne 0 ]; then
+      errexit "USB mass storage device in use (mounted)"
+    fi
+    DEVSIZE=$(blockdev --getsz "${USB_DEST}")
+    PTTYPES=()
+    if [ ${DEVSIZE} -le 4294966784 ]; then
+      PTTYPES[0]="dos MBR ON"
+      PTTYPES[1]="gpt GPT OFF"
+    else
+      PTTYPES[0]="gpt GPT ON"
+    fi
+    PTTYPE="$(whiptail --backtitle "USB Boot" --title "Partition Table Type" --notags --radiolist \
+"\nSelect the partition table type to use (MBR = 2TB Maximum)" 10 62 ${#PTTYPES[@]} ${PTTYPES[@]} 3>&1 1>&2 2>&3)"
+    if [[ $? -ne 0 || "${PTTYPE}" = "" ]]; then
+      errexit "Aborted"
+    fi
+    whiptail --backtitle "USB Boot" --title "WARNING"  --yesno "\nWARNING\n\nAll existing data on USB device ${USB_DEST} will be destroyed!\n\nDo you wish to continue?" 14 64
+    YESNO=$?
+    if [ ${YESNO} -ne 0 ]; then
+      errexit "Aborted"
+    fi
+    echo ""
+    echo "Replicating BOOT/ROOT contents from ${ROOT_DEV} to ${USB_DEST} (this will take a while)"
+    if [ "${PTTYPE}" = "dos" ]; then
+      DEVSIZE=$(blockdev --getsz "${USB_DEST}")
+      dd bs=512 seek=0 count=34 if=/dev/zero of="${USB_DEST}" &> /dev/null
+      dd bs=512 seek=$(("${DEVSIZE}" - 33)) count=33 if=/dev/zero of="${USB_DEST}" &> /dev/null
+      partprobe
+      echo "label: dos" | sfdisk "${USB_DEST}" > /dev/null
+      sfdisk "${USB_DEST}" <<EOF &> /dev/null
+,256MiB,c
+,+,83
+EOF
+    else
+      sgdisk -Z "${USB_DEST}" &> /dev/null
+      sgdisk -n 1:0:+256M "${USB_DEST}" > /dev/null
+      sgdisk -t 1:0700 "${USB_DEST}" > /dev/null
+      sgdisk -n 2:0:0 "${USB_DEST}" > /dev/null
+      sgdisk -t 2:8300 "${USB_DEST}" > /dev/null
+    fi
+    partprobe
+    mkfs.vfat "${USB_BOOT}" > /dev/null
+    if [ $? -ne 0 ]; then
+      errexit "Unable to create BOOT filesystem"
+    fi
+    dosfsck "${USB_BOOT}" > /dev/null
+    if [ $? -ne 0 ]; then
+      errexit "BOOT filesystem appears corrupted"
+    fi
+    if [ "${ROOT_TYPE}" = "f2fs" ]; then
+      mkfs.f2fs -f "${USB_ROOT}" > /dev/null
+    else
+      mkfs.ext4 -F -q -b 4096 "${USB_ROOT}" > /dev/null
+    fi
+    if [ $? -ne 0 ]; then
+      errexit "Unable to create ROOT filesystem"
+    fi
+    mntdev "${USB_DEST}"
+    rsync -aDH --partial --numeric-ids --delete --force --exclude "${MNTPATH}" --exclude '/dev' --exclude '/lost+found' --exclude '/media' --exclude '/mnt' \
+--exclude '/proc' --exclude '/run' --exclude '/sys' --exclude '/tmp' --exclude '/etc/udev/rules.d/70-persistent-net.rules' \
+--exclude '/var/lib/asterisk/astdb.sqlite3-journal' "${OPTIONS[@]}" / "${MNTPATH}/"
+    if [[ $? -ne 0 && $? -ne 24 ]]; then
+      errexit "Unable to replicate BOOT/ROOT contents from ${ROOT_DEV} to ${USB_DEST}"
+    fi
+    mkdir -p "${MNTPATH}/dev/" "${MNTPATH}/lost+found/" "${MNTPATH}/media/" "${MNTPATH}/mnt/" "${MNTPATH}/proc/" "${MNTPATH}/run/" "${MNTPATH}/sys/" "${MNTPATH}/tmp/"
+    if [ $? -ne 0 ]; then
+      errexit "Unable to create directories"
+    fi
+    chmod a+rwxt "${MNTPATH}/tmp/"
+    umntdev
+    echo ""
+    echo "BOOT/ROOT contents replicated from ${ROOT_DEV} to ${USB_DEST}"
+  fi
+fi
+if [ "${USESDC}" = "TRUE" ]; then
+  if [ -b /dev/mmcblk0 ]; then
+    while [ "$(blkid /dev/mmcblk0p2 | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" = "$(blkid ${USB_DEST}2 | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" ]
+    do
+      echo ""
+      echo "WARNING : SD card (/dev/mmcblk0) and USB device (${USB_DEST}) have the same PARTUUID : SD card will boot instead of USB device"
+      echo ""
+      echo -n "Ok to change PARTUUID on USB device (${USB_DEST}) (y/n)? "
+      while read -r -n 1 -s answer; do
+        if [[ "${answer}" = [yYnN] ]]; then
+          echo "${answer}"
+          if [[ "${answer}" = [yY] ]]; then
+            break
+          else
+            break 2
+          fi
+        fi
+      done
+      echo ""
+      echo "Changing PARTUUID on USB device (${USB_DEST})"
+      PTTYPE="$(blkid "${USB_DEST}" | sed -n 's|^.*PTTYPE="\(\S\+\)".*|\1|p')"
+      if [ "${PTTYPE}" = "dos" ]; then
+        PTUUID="$(hexdump -n 4 -e '"%08X"' /dev/random | tr [A-Z] [a-z])"
+        fdisk "${USB_DEST}" <<EOF &> /dev/null
+x
+i
+0x${PTUUID}
+r
+w
+EOF
+      else
+        sgdisk -u 2:'R' "${USB_DEST}" &> /dev/null
+      fi
+    done
+  else
+    errexit "No SD card present"
+  fi
+fi
+if [ "${PTTYPE}" = "gpt" ]; then
+  gdisk "${USB_DEST}" <<EOF > /dev/null
+r
+h
+1
+n
+0c
+n
+n
+w
+y
+EOF
+fi
+partprobe &> /dev/null
+PARTUUID_1="$(blkid "${USB_BOOT}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+PARTUUID_2="$(blkid "${USB_ROOT}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+if [ "${USESDC}" = "TRUE" ]; then
+  if [ -b /dev/mmcblk0 ]; then
+    mntdev "/dev/mmcblk0p"
+    sed -i "/^[[:space:]]*#/!s|^\(.*root=\)\S\+\(\s\+.*\)$|\1PARTUUID=${PARTUUID_2}\2|" "${MNTPATH}/boot/cmdline.txt"
+    umntdev
+  else
+    errexit "No SD card present"
+  fi
+fi
+mntdev "${USB_DEST}"
+sed -i "/^[[:space:]]*#/!s|^\(.*root=\)\S\+\(\s\+.*\)$|\1PARTUUID=${PARTUUID_2}\2|" "${MNTPATH}/boot/cmdline.txt"
+sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/\s\+.*\)$|PARTUUID=${PARTUUID_2}\1|" "${MNTPATH}/etc/fstab"
+if [ "${USESDC}" = "TRUE" ]; then
+  sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/boot\s\+.*\)$|/dev/mmcblk0p1\1|" "${MNTPATH}/etc/fstab"
+  if [ $(grep -v '^[[:space:]]*#' "${MNTPATH}/etc/rc.local" | grep -c 'usb-boot-init') -eq 0 ]; then
+    cat <<\EOF1 > "${MNTPATH}/etc/usb-boot-init"
+#!/bin/bash
+
+MNTBOOT="/tmp/usb-boot-init-mnt"
+
+REBOOT=FALSE
+ROOT_PART="$(mount | sed -n 's|^\(/dev/.*\) on / .*|\1|p')"
+ROOT_DEV="$(sed 's/[0-9]\+$//' <<< "${ROOT_PART}")"
+if [ "${ROOT_DEV}" = "/dev/mmcblk0p" ]; then
+  ROOT_DEV="${ROOT_DEV:0:(${#ROOT_DEV} - 1)}"
+fi
+mkdir -p "${MNTBOOT}/"
+mount "${ROOT_DEV}1" "${MNTBOOT}/"
+if [ "$(find "${MNTBOOT}/" -type f -iregex "${MNTBOOT}/ssh\(\.txt\)?" -print -delete)" != "" ]; then
+  update-rc.d ssh enable && invoke-rc.d ssh start
+fi
+if [ -f "${MNTBOOT}/wpa_supplicant.conf" ]; then
+  mv "${MNTBOOT}/wpa_supplicant.conf" /etc/wpa_supplicant/wpa_supplicant.conf
+  REBOOT=TRUE
+fi
+if [[ $(grep -v '^[[:space:]]*#' "${MNTBOOT}/cmdline.txt" | grep -c 'init=/usr/lib/raspi-config/init_resize.sh') -ne 0 ]]; then
+  sed -i '/^[[:space:]]*#/!s|\(^.*rootwait\).*$|\1|' "${MNTBOOT}/cmdline.txt"
+  START2=$(sfdisk -d "${ROOT_DEV}" | sed -n "s|^${ROOT_PART}\s\+:.*start=\s*\([0-9]\+\).*$|\1|p")
+  PTTYPE="$(blkid "${ROOT_DEV}" | sed -n 's|^.*PTTYPE="\(\S\+\)".*|\1|p')"
+  if [ "${PTTYPE}" = "dos" ]; then
+    sfdisk --delete "${ROOT_DEV}" 2 > /dev/null
+    echo "${START2},+" | sfdisk --no-reread --no-tell-kernel -N2 "${ROOT_DEV}" &> /dev/null
+  else
+    PARTUUID="$(blkid "${ROOT_PART}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+    sgdisk -d 2 "${ROOT_DEV}" > /dev/null
+    sgdisk -n 2:${START2}:0 "${ROOT_DEV}" > /dev/null
+    sgdisk -u 2:${PARTUUID} "${ROOT_DEV}" > /dev/null
+  fi
+  cat <<\EOF2 > /etc/init.d/resize_root_fs
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides: resize_root_fs
+# Required-Start:
+# Required-Stop:
+# Default-Start: 3
+# Default-Stop:
+# Short-Description: Resize root filesystem
+# Description:
+### END INIT INFO
+
+case "$1" in
+  start)
+    resize2fs "$(mount | sed -n 's|^\(/dev/.*\) on / .*|\1|p')"
+    update-rc.d resize_root_fs remove
+    rm /etc/init.d/resize_root_fs
+    ;;
+  *)
+    exit 3
+    ;;
+esac
+EOF2
+  chmod +x /etc/init.d/resize_root_fs
+  update-rc.d resize_root_fs defaults
+  REBOOT=TRUE
+fi
+umount "${MNTBOOT}/"
+rm -r "${MNTBOOT}/"
+sed -i '/usb-boot-init/d' /etc/rc.local
+rm /etc/usb-boot-init
+if [ "${REBOOT}" = "TRUE" ]; then
+  shutdown --no-wall -r now
+fi
+EOF1
+    chmod +x "${MNTPATH}/etc/usb-boot-init"
+    sed -i 's|^exit 0$|/etc/usb-boot-init\nexit 0|' "${MNTPATH}/etc/rc.local"
+  fi
+else
+  sed -i "/^[[:space:]]*#/!s|^\S\+\(\s\+/boot\s\+.*\)$|PARTUUID=${PARTUUID_1}\1|" "${MNTPATH}/etc/fstab"
+fi
+umntdev
+DEV_LIST=()
+if [ -b /dev/mmcblk0 ]; then
+  DEV_LIST+=/dev/mmcblk0p2
+fi
+DEV_LIST+=($(ls -l /dev/sd?2 2> /dev/null | sed -n 's|^.*\(/dev/.*\)|\1|p'))
+if [ ${#DEV_LIST[@]} -gt 1 ]; then
+  for i in ${!DEV_LIST[@]}; do
+    if [ ${i} -lt $((${#DEV_LIST[@]} - 1)) ]; then
+      j=$((i + 1))
+      while [ ${j} -lt ${#DEV_LIST[@]} ]; do
+        if [ "$(blkid "${DEV_LIST[i]}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" = "$(blkid "${DEV_LIST[j]}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')" ]; then
+          if [[ "${DEV_LIST[i]}" != "/dev/mmcblk0p2" || "${DEV_LIST[j]}" != "${USB_DEST}2" ]]; then
+            echo ""
+            echo "WARNING : ${DEV_LIST[i]} and ${DEV_LIST[j]} have the same PARTUUID : $(blkid "${DEV_LIST[i]}" | sed -n 's|^.*PARTUUID="\(\S\+\)".*|\1|p')"
+          fi
+        fi
+      ((j += 1))
+      done
+    fi
+  done
+fi
+if [ "${USESDC}" = "TRUE" ]; then
+  echo ""
+  echo "SD card must remain in place to boot the USB device"
+else
+  if [ -b /dev/mmcblk0 ]; then
+    echo ""
+    echo "SD card must be removed to boot the USB device"
+  fi
+fi
+echo ""
