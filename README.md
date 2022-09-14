@@ -1,4 +1,4 @@
-# usb-boot
+# raspi-usb-boot
 Running Raspbian from USB Devices : Made Easy
 
 Created by RonR, extracted from https://www.raspberrypi.org/forums/viewtopic.php?f=29&t=196778
